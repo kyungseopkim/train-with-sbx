@@ -1,120 +1,98 @@
-# rl-model
+# RL-Model (train-with-sbx)
 
-Reinforcement learning stock trading agent using PPO (Proximal Policy Optimization) via [stable-baselines3](https://github.com/DLR-RM/stable-baselines3). The agent learns intraday trading decisions on a single stock per episode, using technical indicators as observations.
+A high-performance Reinforcement Learning stock trading framework using JAX-accelerated algorithms via [SBX (Stable Baselines JAX)](https://github.com/araffin/sbx). This project implements intraday trading agents that learn optimal portfolio allocation on a single stock per episode using technical indicators and JAX-based environments.
+
+## Features
+
+- **JAX Acceleration**: Uses `sbx-rl` for lightning-fast training on NVIDIA GPUs (CUDA 13.0).
+- **Polars Integration**: Efficient data processing and technical indicator calculation using [Polars](https://pola.rs/).
+- **Vectorized Environments**: Support for high-throughput training via `jax_env.py` and `vec_env.py`.
+- **MySQL Backend**: Integrated with MySQL for historical daily and intraday bar data.
+- **Walk-forward Pipeline**: Robust training and evaluation pipeline with concurrent data prefetching.
+- **Modern Python Stack**: Built with Python 3.14+, `uv` for dependency management, and `Gymnasium` for environment standards.
 
 ## Requirements
 
-- Python >= 3.14
-- MySQL database with daily and intraday bar tables
-- NVIDIA GPU (CUDA 13.0) for training
-- [uv](https://docs.astral.sh/uv/) package manager
+- **Python**: >= 3.14
+- **Hardware**: NVIDIA GPU (optimized for CUDA 13.0/GB10)
+- **Database**: MySQL server with `daily` and `historical` bar tables.
+- **Tools**: [uv](https://docs.astral.sh/uv/) package manager.
 
 ## Setup
 
 ```bash
-# Install dependencies
+# Clone the repository
+git clone git@github.com:kyungseopkim/train-with-sbx.git
+cd train-with-sbx
+
+# Install dependencies using uv
 uv sync
 
-# Configure database connection
-cp .env.example .env  # then edit with your DB credentials
+# Configure environment variables
+cp .env.example .env  # Update with your MySQL credentials
 ```
 
-The `.env` file should contain:
+### Database Schema
 
-```
-DB_HOST=localhost
-DB_PORT=3306
-DB_NAME=your_database
-DB_USER=your_user
-DB_PASSWORD=your_password
-```
+Ensure your MySQL database has the following tables for each ticker (e.g., `AAPL`):
 
-The database must have two tables per ticker:
-
-- `{ticker}_daily` — daily OHLCV bars with columns: `date`, `open`, `high`, `low`, `close`, `volume`, `vwap`
-- `{ticker}_historical` — intraday minute bars with columns: `timestamp`, `open`, `high`, `low`, `close`, `volume`, `vwap`
+- **`{ticker}_daily`**: Columns: `date`, `open`, `high`, `low`, `close`, `volume`, `vwap`.
+- **`{ticker}_historical`**: Columns: `timestamp`, `open`, `high`, `low`, `close`, `volume`, `vwap`.
 
 ## Usage
 
-### Single-day training
-
-Train a PPO agent on one day of intraday data:
+The project uses `rich-click` for a polished CLI experience. You can run the main entry point via:
 
 ```bash
-uv run python examples/one_day_training.py AAPL 2026-01-15
-uv run python examples/one_day_training.py AAPL 2026-01-15 --timesteps 2000000
+uv run rl-model --help
 ```
 
-### Walk-forward training
+### Training
 
-Train across a date range with daily walk-forward evaluation. Uses an actor-based pipeline with parallel data prefetching:
+To start the training pipeline:
 
 ```bash
-uv run python examples/walk_forward_training.py AAPL 2025-01-01 2025-12-31
-uv run python examples/walk_forward_training.py AAPL 2025-01-01 2025-12-31 \
-    --timesteps 200000 --n-envs 8 --save-every 50
+uv run rl-model train AAPL --start-date 2025-01-01 --end-date 2025-12-31
 ```
 
-To resume training from a previously saved model on a new date range, use `--model`:
+### Running Tests
 
 ```bash
-uv run python examples/walk_forward_training.py AAPL 2026-01-01 2026-06-30 \
-    --model results/model_aapl_2025-01-01_2025-12-31.zip
+# Run all tests (utilizes mocks, no DB required)
+uv run pytest
+
+# Run with coverage
+uv run pytest --cov=src/rl_model
 ```
 
-Without `--model`, the script auto-detects a model matching the exact ticker/start/end dates. Use `--from-scratch` to skip all resume logic and train a fresh model.
+## Project Structure
 
-Results are saved to `results/` as CSV files and model checkpoints. Training can be interrupted with Ctrl+C and the current model will be saved.
+- `src/rl_model/`
+  - `main.py`: CLI entry point.
+  - `pipeline.py`: Orchestrates the training/evaluation workflow.
+  - `jax_env.py`: JAX-compatible environment implementation.
+  - `env.py`: Standard Gymnasium environment.
+  - `db.py`: Database interface and caching logic.
+  - `indicators.py`: Technical indicator calculations using Polars.
+  - `vec_env.py`: Vectorized environment wrappers.
+- `tests/`: Comprehensive test suite for all modules.
 
 ## Architecture
 
-```
-db.py → indicators.py → env.py
-                           ↑
-                       pipeline.py (walk-forward orchestration)
-```
-
-### `src/rl_model/db.py`
-
-MySQL queries via pymysql. `get_date_window(ticker, date)` is the main entry point: fetches 90 prior daily bars from `{ticker}_daily` and intraday minute bars from `{ticker}_historical`, then concatenates them into a unified Polars DataFrame.
-
-`DailyBarCache` bulk-fetches all daily bars for a ticker in one query, eliminating redundant DB round-trips during walk-forward training (250 days share ~99% of daily bar data).
-
-### `src/rl_model/indicators.py`
-
-Pure Polars transformations. `add_all_indicators()` chains SMA, EMA, RSI, MACD, Bollinger Bands, ATR, OBV, and Stochastic oscillator onto the DataFrame. `normalize()` z-score normalizes all numeric columns.
-
-### `src/rl_model/env.py`
-
-Gymnasium environment (`StockTradingEnv`). Discrete action space of 5 actions mapping to target portfolio allocations (0%, 25%, 50%, 75%, 100% in stock). Observation is 23 normalized feature columns. Reward is step-over-step portfolio value change. One episode = one trading day of minute bars.
-
-`StockTradingEnv.from_arrays()` creates an environment from pre-computed numpy arrays, skipping DB and indicator work (used by the pipeline for vectorized training).
-
-### `src/rl_model/pipeline.py`
-
-Actor-based concurrent training pipeline for walk-forward evaluation:
-
-- **DataPool** — N worker threads prefetch and process data in parallel via a bounded queue. Uses `DailyBarCache` to avoid redundant daily bar queries.
-- **TrainingPipeline** — Main-thread GPU training. Builds `DummyVecEnv` from prefetched data, trains PPO, evaluates on the next day.
-- **LoggerActor** — Asynchronous result collection.
-
-## Testing
-
-```bash
-# Run all tests (no DB connection needed — tests use mocks)
-uv run pytest
-
-# Run a specific test file
-uv run pytest tests/test_env.py
-
-# Run a specific test
-uv run pytest tests/test_env.py::test_buy_updates_portfolio
+```text
+Database (MySQL) ──> Polars (Indicators) ──> Gymnasium/JAX Env ──> SBX (PPO/DQN/etc)
+      ^                    ^                       ^                      |
+      └────────────────────┴────────── Pipeline ───┴──────────────────────┘
 ```
 
-## Key Design Decisions
+## Contributing
 
-- Data is loaded once per environment construction, not per step — one episode per env instance
-- Tests mock DB functions so no database connection is needed
-- Polars is used throughout instead of pandas
-- Walk-forward pipeline uses `DailyBarCache` to reduce ~250 daily-bar queries to 1
-- Unified CPU-GPU memory (NVIDIA GB10) means numpy arrays from worker threads need no explicit transfer to GPU
+1. Fork the repository.
+2. Create a feature branch (`git checkout -b feature/amazing-feature`).
+3. Commit your changes (`git commit -m 'feat: add amazing feature'`).
+4. Push to the branch (`git push origin feature/amazing-feature`).
+5. Open a Pull Request.
+
+## License
+
+Distributed under the MIT License. See `LICENSE` for more information.
